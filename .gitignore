@@ -10,3 +10,5 @@ wheels/
 .venv
 
 *.las
+*.dxf
+*.gpkg

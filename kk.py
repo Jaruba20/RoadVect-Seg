@@ -1,4 +1,5 @@
 import argparse
+import os
 
 import CSF  # The Cloth Simulation Filter binding
 import geopandas as gpd
@@ -7,7 +8,8 @@ import numpy as np
 import overturemaps
 import shapely
 from pyproj import Transformer
-from shapely.geometry import box
+from scipy.spatial import KDTree
+from shapely.geometry import LineString, MultiLineString, box
 from shapely.ops import unary_union
 
 # =====================================================================
@@ -17,7 +19,9 @@ from shapely.ops import unary_union
 MIN_X, MAX_X = 368000, 369000
 MIN_Y, MAX_Y = 4066000, 4067000
 LOCAL_EPSG = "EPSG:25830"  # ETRS89 / UTM zone 30N
-INPUT_LAZ = "PNOA.las"
+INPUT_LAZ = "PNOA.las"  # PNOA_2024_AND_368-4067_H30_NPC01.laz
+ADJUST_TO_Z = True
+CACHE_FILE = "overture_cache.gpkg"  # Local storage file name
 
 # Overture 'class' properties mapped to real-world metric total road widths
 ROAD_WIDTH_DICTIONARY = {
@@ -37,13 +41,20 @@ ROAD_WIDTH_DICTIONARY = {
 
 
 def fetch_overture_roads():
-    """Calculates boundaries, downloads data, and parses Overture vector geometries."""
+    """Checks for a local cache file, otherwise downloads vector data from Overture."""
+    # If cache exists, load it natively from disk instantly
+    if os.path.exists(CACHE_FILE):
+        print(f"Loading road network from local offline cache: '{CACHE_FILE}'...")
+        roads_gdf = gpd.read_file(CACHE_FILE)
+        return roads_gdf
+
+    # Otherwise, execute the standard download pipeline
     transformer_to_wgs84 = Transformer.from_crs(LOCAL_EPSG, "EPSG:4326", always_xy=True)
     lon_min, lat_min = transformer_to_wgs84.transform(MIN_X, MIN_Y)
     lon_max, lat_max = transformer_to_wgs84.transform(MAX_X, MAX_Y)
 
     print(
-        f"Fetching Overture data for BBox (GPS): {lon_min:.4f}, {lat_min:.4f} to {lon_max:.4f}, {lat_max:.4f}"
+        f"Cache not found. Fetching Overture data via API for BBox: {lon_min:.4f}, {lat_min:.4f} to {lon_max:.4f}, {lat_max:.4f}"
     )
 
     try:
@@ -60,6 +71,27 @@ def fetch_overture_roads():
         )
         roads_gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:4326")
         roads_gdf = roads_gdf.to_crs(LOCAL_EPSG)
+
+        # FIX: Ensure 'class' column is explicitly converted to standard string type
+        if "class" in roads_gdf.columns:
+            roads_gdf["class"] = roads_gdf["class"].astype(str)
+
+        print(f"Saving downloaded segments to local cache: '{CACHE_FILE}'...")
+
+        # FIX: Instead of stripping data types, just drop columns containing un-saveable nested lists/dicts
+        complex_columns = [
+            "sources",
+            "width_rules",
+            "road_flags",
+            "prohibited_transitions",
+            "speed_limits",
+        ]
+        clean_roads_gdf = roads_gdf.drop(
+            columns=[col for col in complex_columns if col in roads_gdf.columns]
+        )
+
+        clean_roads_gdf.to_file(CACHE_FILE, driver="GPKG")
+
         print(f"Successfully loaded {len(roads_gdf)} regional road segments.")
         return roads_gdf
 
@@ -143,6 +175,76 @@ def run_vector_dxf_export(roads_gdf):
     print("Cropping road lines exactly to the 1x1 km tile bounding box...")
     bbox_polygon = box(MIN_X, MIN_Y, MAX_X, MAX_Y)
     cropped_roads = roads_gdf.clip(bbox_polygon).copy()
+
+    if ADJUST_TO_Z:
+        print(
+            f"Reading PNOA reference data from {INPUT_LAZ} to build altitude matrix..."
+        )
+        las = laspy.read(INPUT_LAZ)
+        pnoa_xy = np.vstack((las.x, las.y)).T
+        pnoa_z = np.array(las.z)
+
+        print(
+            "Building spatial lookup tree (KD-Tree) for fast neighborhood indexing..."
+        )
+        spatial_tree = KDTree(pnoa_xy)
+
+        print(
+            "Snapping line vertices to the local 5th percentile Z-value (the floor)..."
+        )
+        snapped_geometries = []
+        search_radius = 1.0  # Look up within a 3-meter radius circle around the vertex
+        percentile_target = (
+            5.0  # 5th percentile isolates true ground, ignoring objects above
+        )
+
+        for _, row in cropped_roads.iterrows():
+            geom = row["geometry"]
+
+            # FIX: Break MultiLineStrings down into individual simple lines
+            sub_lines = (
+                geom.geoms
+                if isinstance(
+                    geom,
+                    (MultiLineString, shapely.geometry.collection.GeometryCollection),
+                )
+                else [geom]
+            )
+
+            processed_sub_lines = []
+            for line in sub_lines:
+                if not isinstance(line, LineString):
+                    continue
+
+                snapped_coords = []
+                for x, y in line.coords:
+                    # Query point cloud neighbors surrounding the coordinate coordinate vertex
+                    neighbor_indices = spatial_tree.query_ball_point(
+                        [x, y], r=search_radius
+                    )
+
+                    if len(neighbor_indices) > 0:
+                        local_z_values = pnoa_z[neighbor_indices]
+                        snapped_z = np.percentile(local_z_values, percentile_target)
+                    else:
+                        snapped_z = 0.0  # Fallback out-of-bounds boundary elevation
+
+                    snapped_coords.append((x, y, snapped_z))
+
+                if len(snapped_coords) >= 2:
+                    processed_sub_lines.append(LineString(snapped_coords))
+
+            # Re-bundle the 3D-snapped line components back into the array row structure
+            if len(processed_sub_lines) == 1:
+                snapped_geometries.append(processed_sub_lines[0])
+            elif len(processed_sub_lines) > 1:
+                snapped_geometries.append(MultiLineString(processed_sub_lines))
+            else:
+                snapped_geometries.append(
+                    geom
+                )  # Fallback to original layout if sampling failed
+
+        cropped_roads["geometry"] = snapped_geometries
 
     print("Mapping labels ('class') to standalone CAD rendering layers...")
     # FIX 1: Use a capital 'Layer' and explicitly cast to strings to satisfy Fiona requirements
